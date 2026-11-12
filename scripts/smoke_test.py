@@ -1,15 +1,18 @@
 """对运行中的服务做端到端冒烟验证（默认 http://127.0.0.1:8000）。
 
 用法：python3 scripts/smoke_test.py [base_url] [sample_data_dir]
-覆盖：导入 -> 分组 -> 指定分区 -> 继承 -> 冲突拒绝 -> 幂等 -> 下载 -> 并发一致性。
+覆盖：导入 -> 分组 -> 指定分区 -> 继承 -> 冲突拒绝 -> 幂等 -> 下载 -> 并发一致性
+      -> ZIP 图像入库（分块、校验、复用、整包拒绝、查询/下载、并发）。
 """
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import os
 import sys
 import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -18,6 +21,7 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 SAMPLES = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data"
 )
+ZIPS = os.path.join(SAMPLES, "zips")
 
 client = httpx.Client(base_url=BASE, timeout=30)
 failures = []
@@ -138,10 +142,128 @@ check("并发新图全部继承 train", conc_ok)
 train_rows = list(csv.DictReader(io.StringIO(client.get("/downloads/train").text)))
 check("并发后 train CSV 完整一致", len(train_rows) == 15, f"rows={len(train_rows)}")
 
+# ---------------------------------------------------------------------------
+# 13. ZIP 图像入库
+# ---------------------------------------------------------------------------
+
+def upload_zip(name):
+    with open(os.path.join(ZIPS, name), "rb") as f:
+        return client.post(
+            "/images/zip-ingests",
+            files={"file": (name, f, "application/zip")},
+        )
+
+
+def zip_bytes(name, member=None):
+    with zipfile.ZipFile(os.path.join(ZIPS, name)) as zf:
+        if member is None:
+            member = zf.namelist()[0]
+        return zf.read(member)
+
+
+# 入库前：已登记但无图像
+st = client.get("/images/IMG001/blob").json()
+check("入库前状态 stored=false", st["registered"] is True and st["stored"] is False)
+check("入库前下载 404", client.get("/images/IMG001/download").status_code == 404)
+
+# 13.1 正常入库 5 张
+r = upload_zip("images_batch1.zip")
+check("ZIP 首批入库", r.status_code == 200 and r.json()["published"] == 5, r.text[:200])
+check(
+    "状态接口可查",
+    client.get("/images/IMG003/blob").json()["stored"] is True
+    and client.get("/images/IMG003/blob").json()["filename"] == "IMG003.jpg",
+)
+
+# 13.2 下载原字节，SHA-256 与本地一致
+r = client.get("/images/IMG001/download")
+local = zip_bytes("images_batch1.zip", "IMG001.jpg")
+check(
+    "下载原字节一致且 SHA-256 正确",
+    r.status_code == 200
+    and r.content == local
+    and r.headers["X-Content-SHA256"] == hashlib.sha256(local).hexdigest(),
+)
+
+# 13.3 同 ID 同字节重传：全部复用
+r = upload_zip("images_batch1_resend.zip")
+check("同字节重传复用", r.status_code == 200 and r.json()["reused"] == 5 and r.json()["published"] == 0)
+
+# 13.4 同 ID 异字节：整包拒绝，原文件仍可下载
+r = upload_zip("images_batch1_conflict.zip")
+detail = r.json().get("detail", {})
+check(
+    "异字节整包拒绝(409)",
+    r.status_code == 409 and detail.get("error") == "blob_content_conflict"
+    and detail["conflicts"][0]["image_id"] == "IMG001",
+    r.text[:200],
+)
+check("冲突后原字节不变", client.get("/images/IMG001/download").content == local)
+
+# 13.5 未登记 ID：整包拒绝
+r = upload_zip("images_unregistered.zip")
+detail = r.json().get("detail", {})
+check(
+    "未登记 ID 整包拒绝(409)",
+    r.status_code == 409
+    and detail.get("error") == "unregistered_images"
+    and detail["missing_image_ids"] == ["IMG999"],
+    r.text[:200],
+)
+check("整包拒绝不留半包", client.get("/images/IMG002/blob").json()["stored"] is True)
+
+# 13.6 命名/结构不合法：400
+r = upload_zip("images_invalid_naming.zip")
+check("非法 ZIP 条目 400", r.status_code == 400 and r.json()["detail"]["error"] in
+      ("nested_member", "invalid_image_id", "not_jpeg"), r.text[:200])
+
+# 13.7 非 ZIP 文件：400
+r = client.post(
+    "/images/zip-ingests",
+    files={"file": ("fake.zip", b"not a zip", "application/zip")},
+)
+check("非 ZIP 400", r.status_code == 400 and r.json()["detail"]["error"] == "not_a_zip")
+
+# 13.8 未登记 ID 的状态/下载接口 404
+check("未知 ID 状态 404", client.get("/images/NOPE/blob").status_code == 404)
+check("未知 ID 下载 404", client.get("/images/NOPE/download").status_code == 404)
+
+# 13.9 后续批次入库（IMG006~IMG008 已在前面的 CSV 流程登记）
+r = upload_zip("images_batch2.zip")
+check("后续批次入库", r.status_code == 200 and r.json()["published"] == 3, r.text[:200])
+check("stats 已入库计数", client.get("/stats").json()["images_with_blob"] == 8)
+
+# 13.10 HTTP 级并发：同字节重传与各自新包混合，全部合法且无覆盖
+def zip_worker(i):
+    c = httpx.Client(base_url=BASE, timeout=30)
+    try:
+        if i % 2 == 0:
+            with open(os.path.join(ZIPS, "images_batch1_resend.zip"), "rb") as f:
+                return c.post(
+                    "/images/zip-ingests",
+                    files={"file": ("r.zip", f, "application/zip")},
+                ).status_code
+        # 奇数线程传一个只含已登记 IMG005 的小 ZIP
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("IMG005.jpg", zip_bytes("images_batch1.zip", "IMG005.jpg"))
+        return c.post(
+            "/images/zip-ingests",
+            files={"file": ("s.zip", buf.getvalue(), "application/zip")},
+        ).status_code
+    finally:
+        c.close()
+
+with ThreadPoolExecutor(max_workers=8) as pool:
+    codes = list(pool.map(zip_worker, range(8)))
+check("并发 ZIP 上传全部合法", all(code == 200 for code in codes), str(codes))
+check("并发后 IMG001 字节未被覆盖", client.get("/images/IMG001/download").content == local)
+
 stats = client.get("/stats").json()
 print("最终状态:", stats)
 # 5(batch1) + 2(batch2) + 1(batch3) + 10(并发) = 18；冲突与异内容导入被拒绝不计入
 check("最终图片数=18", stats["images"] == 18)
+check("最终已入库图像=8", stats["images_with_blob"] == 8)
 
 print()
 if failures:

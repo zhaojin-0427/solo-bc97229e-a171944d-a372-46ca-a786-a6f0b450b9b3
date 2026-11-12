@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS meta (
     value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO meta(key, value) VALUES ('state_version', 0);
+
+-- ZIP 入库的图像引用：原字节按 SHA-256 内容寻址存在本地数据卷 blobs/ 下，
+-- 这里只保存引用。image_id 外键到 images（必须先在 CSV 目录登记）。
+CREATE TABLE IF NOT EXISTS image_blobs (
+    image_id   TEXT PRIMARY KEY REFERENCES images(image_id),
+    sha256     TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+    stored_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_image_blobs_sha ON image_blobs(sha256);
 """
 
 

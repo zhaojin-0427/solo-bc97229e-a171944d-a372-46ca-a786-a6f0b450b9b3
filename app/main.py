@@ -1,16 +1,17 @@
-"""FastAPI 接口层：导入 CSV、指定分区、未分区列表与分区 CSV 下载。"""
+"""FastAPI 接口层：导入 CSV、指定分区、未分区列表、分区 CSV 下载与 ZIP 图像入库。"""
 from __future__ import annotations
 
 import csv
 import io
+import os
 from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
-from . import core
+from . import core, storage
 from .db import connect, init_db, read_txn, state_version
 
 Partition = Literal["train", "val"]
@@ -25,17 +26,20 @@ HEADER_ALIASES = {
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    # 建数据卷目录、清理上次进程残留的暂存上传、回收无引用 blob
+    storage.init_storage()
     yield
 
 
 app = FastAPI(
-    title="质检数据集划分服务",
+    title="质检数据集划分与图像入库服务",
     description=(
-        "管理标注系统导出的图片目录信息（图片ID / 工件号 / 拍摄批次）。\n\n"
+        "管理标注系统导出的图片目录信息（图片ID / 工件号 / 拍摄批次）与相机导出的图像原字节。\n\n"
         "- 同工件号或同拍摄批次的图片沿关联链归为一组，整组进入同一分区；\n"
         "- 按任一图片 ID 将整组指定到 train / val，已指定不可改动；\n"
         "- 新图自动继承关联组分区；导入若连通两个不同分区则整批拒绝；\n"
-        "- 同图片 ID 同内容重传幂等跳过，异内容整批拒绝。"
+        "- 同图片 ID 同内容重传幂等跳过，异内容整批拒绝；\n"
+        "- ZIP 入库仅接受顶层 图片ID.jpg，先登记后入库，同字节复用、异字节整包拒绝，整包原子可见。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -73,6 +77,33 @@ class AssignResult(BaseModel):
     partition: str
     changed: bool = Field(description="本次调用是否真正写入了分区（False 表示组此前已有该分区）")
     images_in_group: int
+
+
+class StoredFile(BaseModel):
+    image_id: str
+    filename: str
+    sha256: str
+    size_bytes: int
+    outcome: str = Field(description="published=本次新入库；reused=同 ID 同字节重传复用")
+
+
+class ZipIngestResult(BaseModel):
+    status: str
+    upload_id: str
+    received: int = Field(description="ZIP 内通过校验的图片文件数")
+    published: int = Field(description="本次新写入数据卷的文件数")
+    reused: int = Field(description="同 ID 同字节重传、复用既有引用的文件数")
+    files: list[StoredFile]
+
+
+class BlobStatus(BaseModel):
+    image_id: str
+    registered: bool = Field(description="是否已在 CSV 目录登记")
+    stored: bool = Field(description="图像原字节是否已入库可下载")
+    filename: str | None = None
+    sha256: str | None = None
+    size_bytes: int | None = None
+    stored_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +274,127 @@ def assign(req: AssignRequest):
     return AssignResult(**result)
 
 
+@app.post(
+    "/images/zip-ingests",
+    tags=["图像入库"],
+    summary="上传 ZIP，批量补入相机导出的图像原字节",
+    response_model=ZipIngestResult,
+    responses={
+        400: {"description": "ZIP 结构/命名/条目不合法，或包内 ID 重复"},
+        409: {"description": "存在未登记 ID（整包拒绝），或同 ID 异字节（整包拒绝）"},
+    },
+)
+def upload_zip(file: UploadFile = File(..., description="ZIP 包：仅含顶层 图片ID.jpg 普通文件")):
+    """整包原子的 ZIP 图像入库。
+
+    流程（全部在磁盘上完成，内存占用与 ZIP 大小无关，且不解码图像）：
+
+    1. 上传流分块 spool 到数据卷临时文件；
+    2. 流式解包到独立暂存目录并逐块计算 SHA-256：只接受顶层 ``图片ID.jpg`` 普通文件，
+       ID 限 ``A-Za-z0-9_-``，包内 ID 不得重复，否则整包拒绝；
+    3. 单写事务内核验：任一 ID 未在 images 登记 -> 整包拒绝；同 ID 异字节 -> 整包拒绝；
+       同 ID 同字节 -> 复用既有引用；
+    4. 校验通过的 blob 原子落位、引用行同事务提交，全部文件一起可查可下载；
+       失败只清理本次暂存，其他上传已发布的文件不受影响。
+    """
+    spool_path = storage.new_spool_path()
+    try:
+        storage.spool_stream(file.file, spool_path)
+        try:
+            upload_id, manifest = storage.extract_zip_to_staging(spool_path)
+        except storage.ZipPackageError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": e.code, "message": e.message, **e.extra},
+            )
+        staging_dir = os.path.join(storage.staging_root(), upload_id)
+        try:
+            try:
+                result = storage.publish_manifest(staging_dir, manifest)
+            except storage.UnregisteredImageError as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "unregistered_images",
+                        "message": (
+                            f"存在 {len(e.missing)} 个尚未登记的图片 ID，整包已拒绝："
+                            + ", ".join(e.missing[:10])
+                            + (" …" if len(e.missing) > 10 else "")
+                        ),
+                        "missing_image_ids": e.missing,
+                    },
+                )
+            except storage.BlobConflictError as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "blob_content_conflict",
+                        "message": "同一图片 ID 已存在不同字节的图像，整包已拒绝",
+                        "conflicts": e.conflicts,
+                    },
+                )
+        finally:
+            # 成功时暂存文件已被 rename 走，删除空目录；失败时整目录回收
+            storage.remove_staging(staging_dir)
+        return ZipIngestResult(status="ok", upload_id=upload_id, **result)
+    finally:
+        storage.remove_spool(spool_path)
+
+
+@app.get(
+    "/images/{image_id}/blob",
+    tags=["图像入库"],
+    summary="按图片 ID 查询图像入库状态",
+    response_model=BlobStatus,
+    responses={404: {"description": "图片 ID 未在 CSV 目录登记"}},
+)
+def blob_status(image_id: str):
+    registered, row = storage.get_storage_row(image_id)
+    if not registered:
+        raise HTTPException(status_code=404, detail=f"图片 {image_id} 尚未登记")
+    if row is None:
+        return BlobStatus(image_id=image_id, registered=True, stored=False)
+    return BlobStatus(
+        image_id=image_id,
+        registered=True,
+        stored=True,
+        filename=f"{image_id}.jpg",
+        sha256=row["sha256"],
+        size_bytes=row["size_bytes"],
+        stored_at=row["stored_at"],
+    )
+
+
+@app.get(
+    "/images/{image_id}/download",
+    tags=["图像入库"],
+    summary="按图片 ID 下载图像原字节",
+    responses={
+        200: {"content": {"image/jpeg": {}}, "description": "图像原字节（不做任何转码）"},
+        404: {"description": "ID 未登记，或已登记但图像尚未入库"},
+    },
+)
+def download_blob(image_id: str):
+    """从数据卷流式返回原始 JPEG 字节，响应头携带 SHA-256 与 ETag。"""
+    registered, row = storage.get_storage_row(image_id)
+    if not registered:
+        raise HTTPException(status_code=404, detail=f"图片 {image_id} 尚未登记")
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"图片 {image_id} 已登记但图像尚未入库")
+    path = storage.blob_path(row["sha256"])
+    if not os.path.isfile(path):  # 防御：引用与物理文件不一致（正常流程不会发生）
+        raise HTTPException(status_code=404, detail="图像物理文件缺失，请联系管理员")
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        filename=f"{image_id}.jpg",
+        headers={
+            "ETag": f'"{row["sha256"]}"',
+            "X-Content-SHA256": row["sha256"],
+        },
+    )
+
+
 @app.get("/images/unpartitioned", tags=["查询"], summary="未分区图片列表")
 def unpartitioned():
     """返回所有所在组尚未指定分区的图片（供训练流水线跟进标注/划分）。"""
@@ -359,10 +511,12 @@ def stats():
                 )
             }
             version = state_version(conn)
+            blobs = conn.execute("SELECT COUNT(*) AS c FROM image_blobs").fetchone()["c"]
     finally:
         conn.close()
     return {
         "images": images,
+        "images_with_blob": blobs,
         "groups": groups,
         "images_by_partition": by_partition,
         "state_version": version,
